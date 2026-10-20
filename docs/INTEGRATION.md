@@ -4,7 +4,7 @@
 
 Verification of relayer access from this frontend and end-to-end settlement validation remain outstanding. The default build disables trading, registration, and staking submissions. Direct wallet maintenance actions still require current account data and explicit wallet confirmation. No live transaction was signed or broadcast during this audit.
 
-The protocol architecture restricts opens/closes to its authorized relayer/BatchExecutor. The official `/intents` endpoint rejected a cross-origin browser preflight from localhost (405 without an allow-origin header). That observation alone does not establish a frontend whitelist or approval requirement. Verify the current endpoint and CORS behavior from the actual deployed origin, plus the intent status/reconciliation API. Do not assume builder-code eligibility is required for basic signed-intent submission. There is no automatic settlement polling in this version; ambiguous outcomes remain blocked until the user verifies official activity.
+The protocol architecture restricts opens/closes to its authorized relayer/BatchExecutor. The official `/intents` endpoint rejected a cross-origin browser preflight from localhost (405 without an allow-origin header). That observation alone does not establish a frontend whitelist or approval requirement. Verify the current endpoint and CORS behavior from the actual deployed origin, plus the intent status/reconciliation API. Do not assume builder-code eligibility is required for basic signed-intent submission. Wallet SSE outcome tracking is implemented; independent transaction reconciliation is not. Requests remain guarded until the user verifies official activity.
 
 Before enabling a relayer, validate registration, owner and session open/close, stake/unstake/claim, replay protection, nonce handling, deadline expiry, rejection, delayed confirmation, and reconciliation with on-chain execution. Test account/network changes and browser reloads during every stage. Confirm supported collateral and deployment addresses with the protocol: the published frontend and older documentation disagree on the collateral token address. This app does not initiate token deposits.
 
@@ -38,6 +38,20 @@ Read-only RPC verification succeeded for the configured Exchange, PaperTokenomic
 7. Add regression tests for mismatched IDs, malformed payloads, out-of-order updates, timeout after acceptance, expired signatures, duplicate requests, revoked sessions, and account changes. Run tests and the production build before enabling submissions.
 8. Perform controlled end-to-end tests in an available staging environment, then explicitly authorized minimal-value live tests if needed. Do not claim settlement coverage from mocked tests or HTTP success.
 
-### Follow-up status
+### Earlier follow-up status
 
 The follow-up could access GitHub but had no usable execution environment; the web reader could not retrieve the official FAQ or JavaScript client. No new endpoint, CORS, status-schema, or live settlement verification was completed. This documentation correction removes the unsupported frontend-approval requirement; it does not enable trading or certify the integration. The FAQ supplied for the follow-up is https://docs.papertrade.xyz/intro/faq/.
+
+## Implemented public outcome tracking — 2026-10-21
+
+The execution environment became available. Read-only GET of the current official frontend identified `app-DL1CQl0h.js` and `hooks-a3qtukpN.js`. Their client still submits `POST /intents` and consumes `GET /state/user/live?wallet=<address>`. No separate GET-by-intent status route was verified.
+
+A GET for the public address `0x0000000000000000000000000000000000000001` returned HTTP 200, `text/event-stream`, and `Access-Control-Allow-Origin: *`. The initial event was `wallet` with accountRevision 1; its sanitized public snapshot is in tests/fixtures/wallet-snapshot.json. A bounded SSE capture ends by timeout because the connection is intentionally long-lived. This is not a stream failure.
+
+The current client defines `wallet` snapshots with address/accountRevision and operation tuples. Patches include baseAccountRevision, state, addedOperations, and optional intentOutcomes tuples `[intentId, outcome]`. Recognized outcomes are succeeded, failed, expired, cancelled, and unknown. Outcomes in patches have no transaction hash. Snapshots do not include historical outcomes; reconnecting after missing a patch cannot establish that request's result.
+
+`settlement.ts` checks wallet identity and exact patch ancestry, ignores old revisions, reconnects with bounded backoff after gaps/errors/silence, serializes persistence with submission locks, and cancels stale work on account changes. Cross-origin EventSource omits credentials, consistent with the public wildcard CORS response. Pending IDs are matched locally; unknown IDs cannot change request records. Outcome reports never become independently verified receipts or silently remove the retry guard. A confirmed POST acknowledgement now also retains that guard. No signed payload or key is added to persistent storage by tracking.
+
+OPTIONS /intents for origin http://localhost:5173, method POST, and requested header content-type returned 405 without CORS allow-origin. Submission from a deployed frontend remains unverified. No POST was sent. A separately hosted frontend must verify access for its actual origin; this does not establish an approval or whitelist requirement. No proxy bypass was added.
+
+Use `npm run verify:public-api -- <frontend-origin>` to repeat GET/OPTIONS probes. Complete action-specific receipt/event matching and controlled execution tests before enabling production submissions. Stream outcome tests and captured snapshot tests are not live settlement tests.

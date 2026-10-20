@@ -31,3 +31,7 @@ Default signed-submission behavior is disabled while these integration requireme
 ## Clarification after the audit
 
 The relayer’s protocol authorization and any frontend access requirements are separate. The localhost preflight failure did not prove that frontends require approval, and builder attribution must not be assumed necessary for basic trading. See the updated integration procedure. This follow-up changed documentation only; the 35-test/build results above describe the earlier code audit, not new live integration testing.
+
+## Public outcome tracker follow-up — 2026-10-21
+
+Implemented wallet SSE tracking, persistent relayer-reported outcomes, account/revision validation, reconnect/cleanup, and guarded confirmed acknowledgements. Public read access and localhost POST-preflight behavior were probed without sending transactions. Added 12 regression tests, bringing the total to 47. Independent chain receipt attribution and live execution remain unverified; reported outcomes do not automatically unlock resubmission. See INTEGRATION.md for source assets, response shape, and coverage limits.

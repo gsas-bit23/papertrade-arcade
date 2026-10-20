@@ -9,20 +9,20 @@ export function validateRelayerUrl(value: string): string {
 }
 export const RELAYER_URL = validateRelayerUrl(import.meta.env.VITE_RELAYER_URL ?? '');
 export function requireRelayer() {
-  if (!RELAYER_URL) throw new Error('Trading is unavailable: an approved relayer connection has not been configured.');
+  if (!RELAYER_URL) throw new Error('Trading is unavailable: a verified relayer connection has not been configured.');
 }
 export type SubmissionState = 'signed' | 'submitting' | 'queued' | 'prepared' | 'confirmed' | 'failed' | 'reverted' | 'expired' | 'cancelled' | 'unknown';
-export interface PendingIntent { id: Hex; user: Address; action: ProtocolAction; deadline: number; state: SubmissionState }
+export interface PendingIntent { id: Hex; user: Address; action: ProtocolAction; deadline: number; state: SubmissionState; reportedOutcome?: 'succeeded' | 'failed' | 'expired' | 'cancelled' | 'unknown'; observedAt?: number }
 const STORAGE = 'papertrade_arcade_pending_v2';
 export function pendingIntents(): PendingIntent[] {
   const raw = localStorage.getItem(STORAGE);
   if (!raw) return [];
   const data: unknown = JSON.parse(raw);
-  if (!Array.isArray(data) || data.some(i => !i || !/^0x[0-9a-f]{64}$/.test(i.id) || !/^0x[0-9a-fA-F]{40}$/.test(i.user) || !Number.isSafeInteger(i.deadline) || !['signed','submitting','queued','prepared','confirmed','failed','reverted','expired','cancelled','unknown'].includes(i.state))) throw new Error('Saved submission history is unreadable. Review your account before clearing it.');
+  if (!Array.isArray(data) || data.some(i => !i || !/^0x[0-9a-f]{64}$/.test(i.id) || !/^0x[0-9a-fA-F]{40}$/.test(i.user) || !Number.isSafeInteger(i.deadline) || !['registerSessionKey','openPosition','closePositions','paperStake','paperUnstake','paperClaim'].includes(i.action) || (i.reportedOutcome !== undefined && !['succeeded','failed','expired','cancelled','unknown'].includes(i.reportedOutcome)) || (i.observedAt !== undefined && (!Number.isSafeInteger(i.observedAt) || i.observedAt < 0)) || !['signed','submitting','queued','prepared','confirmed','failed','reverted','expired','cancelled','unknown'].includes(i.state))) throw new Error('Saved submission history is unreadable. Review your account before clearing it.');
   return data;
 }
 export function hasPendingIntent(user: Address) {
-  return pendingIntents().some(i => i.user.toLowerCase() === user.toLowerCase() && ['submitting','queued','prepared','unknown'].includes(i.state));
+  return pendingIntents().some(i => i.user.toLowerCase() === user.toLowerCase() && ['submitting','queued','prepared','unknown','confirmed'].includes(i.state));
 }
 export function recordIntent(intent: PendingIntent) {
   const items = pendingIntents();

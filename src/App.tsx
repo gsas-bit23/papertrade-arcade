@@ -46,7 +46,8 @@ import {
 import { LivePriceChart } from './components/LivePriceChart';
 
 import { getEthereum, assertWalletAccount } from './blockchain/wallet';
-import { RELAYER_URL, hasPendingIntent, acknowledgePending } from './blockchain/relayer';
+import { RELAYER_URL, hasPendingIntent, acknowledgePending, pendingIntents } from './blockchain/relayer';
+import { watchSettlements, type StreamStatus } from './blockchain/settlement';
 import { parseAmount } from './blockchain/protocolIntents';
 import { isFresh, PRICE_MAX_AGE_MS, CHAIN_MAX_AGE_MS } from './engine/safety';
 
@@ -91,6 +92,11 @@ export const App: React.FC = () => {
   const actionLock = useRef(false);
   const walletGeneration = useRef(0);
   const [now, setNow] = useState(Date.now());
+  const [settlementStatus, setSettlementStatus] = useState<StreamStatus>('connecting');
+  useEffect(() => {
+    if (!walletAddress) return;
+    return watchSettlements(walletAddress, () => setNow(Date.now()), setSettlementStatus);
+  }, [walletAddress]);
   const [knownSessions, setKnownSessions] = useState<SessionMetadata[]>([]);
   useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
   useEffect(() => {
@@ -129,6 +135,8 @@ export const App: React.FC = () => {
   const protocolReady = !protocol.loading && !protocol.error && isFresh(protocol.lastUpdatedMs, CHAIN_MAX_AGE_MS, now);
   const accountReady = !!walletAddress && userState.address?.toLowerCase() === walletAddress.toLowerCase() && !userState.error && isFresh(userState.lastUpdatedMs, CHAIN_MAX_AGE_MS, now);
   const sessionReady = !!sessionKey?.isOnChainRegistered && sessionKey.expiry * 1000 > now + 300_000;
+  let trackedRequests: ReturnType<typeof pendingIntents> = [];
+  try { trackedRequests = pendingIntents().filter(i => i.user.toLowerCase() === walletAddress?.toLowerCase()); } catch { /* storageError below disables submission */ }
   let pending = false;
   let storageError = '';
   try { pending = !!walletAddress && hasPendingIntent(walletAddress); } catch { storageError = 'Submission history is unavailable. Check browser storage and review your account.'; }
@@ -357,7 +365,7 @@ export const App: React.FC = () => {
     <div>
       <div role="status" className="data-status">
         {bbo.historyError && <p>{bbo.historyError}</p>}
-        {!RELAYER_URL && <p>Trading disabled: an approved relayer connection is required. <a href="https://exchange.papertrade.xyz" target="_blank" rel="noopener noreferrer">Trade on the official site</a>.</p>}
+        {!RELAYER_URL && <p>Trading disabled: a verified relayer connection is required. <a href="https://exchange.papertrade.xyz" target="_blank" rel="noopener noreferrer">Trade on the official site</a>.</p>}
         {!protocolReady && <p>On-chain data unavailable or stale: {protocol.error ?? 'synchronizing'}. Displayed values may be incomplete.</p>}
         {!priceReady && <p>Live quote unavailable or stale. Price previews are disabled.</p>}
         {storageError && <p>{storageError}</p>}
@@ -1211,6 +1219,13 @@ export const App: React.FC = () => {
               <h3>Authorized or pending session keys</h3>
               <p>Keys stay in this tab only. Public addresses are retained so you can revoke after reload.</p>
               {knownSessions.map(key => <button key={key.sessionKeyAddress} className="btn" disabled={txBusy} onClick={() => revokeSession(key.sessionKeyAddress)}>Revoke {shortAddr(key.sessionKeyAddress)}</button>)}
+            </section>}
+            {walletAddress && trackedRequests.length > 0 && <section aria-label="Request outcomes" style={{ marginTop: 14 }}>
+              <h3>Request outcomes</h3>
+              <p>Live status: {settlementStatus}. Reported outcomes are not independently verified transaction receipts.</p>
+              {trackedRequests.slice(0, 10).map(request => <p key={request.id}>
+                {request.action} · {request.id.slice(0, 12)}… · {request.reportedOutcome ? `Relayer reports ${request.reportedOutcome}` : `Submission ${request.state}`}
+              </p>)}
             </section>}
             {pending && walletAddress && <section role="status" style={{ marginTop: 14 }}>
               <p>A submission is unresolved. Check <a href="https://exchange.papertrade.xyz" target="_blank" rel="noopener noreferrer">official account activity</a> before another request.</p>
