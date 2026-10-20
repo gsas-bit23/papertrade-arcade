@@ -4,7 +4,7 @@ Scope: frontend source, signing/submission, wallet authorization, contract reads
 
 ## Remediated findings
 
-- Replaced sign-only trade/stake flows with schema-compatible submission and explicit acceptance/execution states; submissions disabled without an approved endpoint.
+- Replaced sign-only trade/stake flows with schema-compatible submission and explicit acceptance/execution states; submissions disabled without a configured endpoint.
 - Added close actions for the connected owner's open BTC/ETH positions.
 - Required actual on-chain session authorization and sufficient expiry before each session signature; owner signatures for all staking operations.
 - Kept session secrets in memory, migrated legacy persisted secrets to public revocation metadata, and preserved revocation state after failed transactions.
@@ -24,6 +24,10 @@ Scope: frontend source, signing/submission, wallet authorization, contract reads
 
 ## Outstanding integration and coverage limits
 
-Production trading is not certified: an approved relayer, automated intent reconciliation, and end-to-end execution/settlement tests remain required. See INTEGRATION.md. No wallet transaction was sent, and no claim of browser-wide visual or live wallet end-to-end coverage is made. Contract parameter changes and integer rounding can differ from display estimates. The collateral address discrepancy must be resolved with the protocol before adding deposits. The build reports a roughly 597 kB main JavaScript chunk; this is a remaining performance optimization, not a build failure.
+Production trading is not certified: verified frontend access to the relayer, automated intent reconciliation, and end-to-end execution/settlement tests remain required. See INTEGRATION.md. No wallet transaction was sent, and no claim of browser-wide visual or live wallet end-to-end coverage is made. Contract parameter changes and integer rounding can differ from display estimates. The collateral address discrepancy must be resolved with the protocol before adding deposits. The build reports a roughly 597 kB main JavaScript chunk; this is a remaining performance optimization, not a build failure.
 
 Default signed-submission behavior is disabled while these integration requirements are unmet. Direct maintenance transactions remain available with wallet confirmation. Unresolved request reconciliation is manual and must only occur after checking official account activity; clearing history does not invalidate a signature.
+
+## Clarification after the audit
+
+The relayer’s protocol authorization and any frontend access requirements are separate. The localhost preflight failure did not prove that frontends require approval, and builder attribution must not be assumed necessary for basic trading. See the updated integration procedure. This follow-up changed documentation only; the 35-test/build results above describe the earlier code audit, not new live integration testing.

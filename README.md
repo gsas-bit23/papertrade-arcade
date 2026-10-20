@@ -2,7 +2,7 @@
 
 An experimental React dashboard for Papertrade on HyperEVM (chain 999), with BTC/ETH market feeds, position previews, account balances, queue inspection, and staking views.
 
-**Trading and staking submissions are disabled by default.** An approved, browser-accessible Papertrade relayer is required. This repository does not contain an authorized relayer. Do not configure the official website as a relayer without protocol approval and successful integration validation. See [integration requirements](docs/INTEGRATION.md) and [audit results](docs/AUDIT.md).
+**Trading and staking submissions are disabled by default.** A compatible, browser-accessible Papertrade relayer endpoint and successful integration validation are required. Protocol authorization of the relayer does not establish a separate approval requirement for frontends. This repository does not contain a relayer. See [integration requirements](docs/INTEGRATION.md) and [audit results](docs/AUDIT.md).
 
 ## Development
 
@@ -15,7 +15,7 @@ npm run build
 npm run dev
 ```
 
-Copy `.env.example` to `.env.local` only when configuring an approved integration. All `VITE_` variables are public; never put keys or secrets in them.
+Copy `.env.example` to `.env.local` only when configuring a verified integration. All `VITE_` variables are public; never put keys or secrets in them.
 
 The dashboard reads HyperEVM RPC and Hyperliquid WebSocket/candle endpoints. Network or contract read failures disable affected actions. Quotes older than 10 seconds and account snapshots older than 15 seconds cannot authorize new trades.
 
