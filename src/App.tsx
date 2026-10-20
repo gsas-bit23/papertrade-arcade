@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Address } from 'viem';
 import {
   Zap,
@@ -20,25 +20,22 @@ import {
   estimateMintedPaperOnLoss,
 } from './engine/papertradeMath';
 import {
-  DEFAULT_BUILDER_CODE_STATE,
-  BuilderCodeConfig,
-} from './config/builderCode';
-import {
   StoredSessionKey,
   loadStoredSessionKey,
   createAndSignSessionKey,
   checkSessionKeyOnChain,
   clearLocalSessionKey,
+  forgetInMemorySessions, sessionMetadata, type SessionMetadata,
 } from './blockchain/sessionKeys';
 import {
   SignedTradeIntent,
   connectEvmWallet,
   signPapertradeIntent,
+  executeSignedIntent,
   callOnChainHarvest,
   callOnChainPushStakerFees,
   callOnChainRequestSweep,
   callOnChainFinalizeSweep,
-  callOnChainLiquidate,
   callOnChainRevokeSessionKey,
 } from './blockchain/intentBuilder';
 import {
@@ -47,6 +44,11 @@ import {
   PixelPrintingPress,
 } from './components/PixelSprites';
 import { LivePriceChart } from './components/LivePriceChart';
+
+import { getEthereum, assertWalletAccount } from './blockchain/wallet';
+import { RELAYER_URL, hasPendingIntent, acknowledgePending } from './blockchain/relayer';
+import { parseAmount } from './blockchain/protocolIntents';
+import { isFresh, PRICE_MAX_AGE_MS, CHAIN_MAX_AGE_MS } from './engine/safety';
 
 type FloorFilter = 'ALL' | 'PIT' | 'QUEUE' | 'PRESS' | 'ROOFTOP';
 
@@ -79,38 +81,63 @@ export const App: React.FC = () => {
   const [spendQueued, setSpendQueued] = useState<boolean>(false);
   const [stakeAmountInput, setStakeAmountInput] = useState<string>('500');
 
-  // Builder Code State
-  const [builderConfig] = useState<BuilderCodeConfig>(
-    DEFAULT_BUILDER_CODE_STATE
-  );
   const [signedIntents, setSignedIntents] = useState<SignedTradeIntent[]>([]);
   const [statusMessage, setStatusMessage] = useState<string>(
-    'Live on HyperEVM (Chain 999) • Real-time BTC & ETH chart connected'
+    'Connecting to market and on-chain data…'
   );
   const [txBusy, setTxBusy] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  const actionLock = useRef(false);
+  const walletGeneration = useRef(0);
+  const [now, setNow] = useState(Date.now());
+  const [knownSessions, setKnownSessions] = useState<SessionMetadata[]>([]);
+  useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
   useEffect(() => {
-    if (!walletAddress) {
-      setSessionKey(null);
-      return;
-    }
-    const stored = loadStoredSessionKey(walletAddress);
-    setSessionKey(stored);
-    if (stored) {
-      checkSessionKeyOnChain(walletAddress, stored.sessionKeyAddress);
-    }
+    let provider: ReturnType<typeof getEthereum>;
+    try { provider = getEthereum(); } catch { return; }
+    const invalidate = () => {
+      walletGeneration.current++;
+      forgetInMemorySessions(); setSessionKey(null); setWalletAddress(null); setSignedIntents([]); setKnownSessions([]);
+      setStatusMessage('Wallet account or network changed. Reconnect to continue.');
+    };
+    for (const event of ['accountsChanged', 'chainChanged', 'disconnect']) provider.on?.(event, invalidate);
+    return () => { for (const event of ['accountsChanged', 'chainChanged', 'disconnect']) provider.removeListener?.(event, invalidate); };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      if (!walletAddress) { setSessionKey(null); setKnownSessions([]); return; }
+      try {
+        const metadata = sessionMetadata(walletAddress);
+        if (active) setKnownSessions(metadata);
+        const key = loadStoredSessionKey(walletAddress);
+        if (!key) { if (active) setSessionKey(null); return; }
+        const validity = await checkSessionKeyOnChain(walletAddress, key.sessionKeyAddress);
+        if (active) setSessionKey({ ...key, isOnChainRegistered: validity.isValid });
+      } catch (error) {
+        if (active) { setSessionKey(null); setStatusMessage(error instanceof Error ? error.message : 'Session status unavailable.'); }
+      }
+    };
+    void refresh();
+    const timer = setInterval(refresh, 10_000);
+    return () => { active = false; clearInterval(timer); };
   }, [walletAddress]);
-
   const activeBbo = bbo[selectedCoin];
-  const currentMid =
-    activeBbo.mid > 0
-      ? activeBbo.mid
-      : selectedCoin === 'BTC'
-      ? 84000
-      : 1900;
-
-  const numericMargin = Math.max(0, parseFloat(marginInput) || 0);
+  const priceReady = bbo.wsConnected && isFresh(activeBbo.timestamp, PRICE_MAX_AGE_MS, now) && activeBbo.mid > 0;
+  const currentMid = priceReady ? activeBbo.mid : 0;
+  const protocolReady = !protocol.loading && !protocol.error && isFresh(protocol.lastUpdatedMs, CHAIN_MAX_AGE_MS, now);
+  const accountReady = !!walletAddress && userState.address?.toLowerCase() === walletAddress.toLowerCase() && !userState.error && isFresh(userState.lastUpdatedMs, CHAIN_MAX_AGE_MS, now);
+  const sessionReady = !!sessionKey?.isOnChainRegistered && sessionKey.expiry * 1000 > now + 300_000;
+  let pending = false;
+  let storageError = '';
+  try { pending = !!walletAddress && hasPendingIntent(walletAddress); } catch { storageError = 'Submission history is unavailable. Check browser storage and review your account.'; }
+  const canSubmit = !!RELAYER_URL && protocolReady && accountReady && !pending && !storageError;
+  let marginRaw = 0n;
+  try { marginRaw = parseAmount(marginInput, 128); } catch { /* validation shown below */ }
+  const numericMargin = marginRaw > 0n ? Number(marginInput) : 0;
+  const availableRaw = spendQueued ? userState.executableQueuedRaw : userState.balanceRaw;
+  const tradeReason = !RELAYER_URL ? 'Trading unavailable: relayer connection is not configured.' : !walletAddress ? 'Connect your wallet.' : storageError || (pending ? 'Review your unresolved submission before trading again.' : !protocolReady || !accountReady ? 'Waiting for current on-chain account data.' : protocol.paused ? 'New positions are paused by the protocol.' : !priceReady ? 'Waiting for a fresh market quote.' : marginRaw === 0n ? 'Enter a valid positive margin.' : marginRaw > availableRaw ? 'Margin exceeds your available balance.' : '');
   const isLongSelected = tradeSide === 'LONG';
 
   // Trade Preview Math
@@ -158,154 +185,94 @@ export const App: React.FC = () => {
     [protocol.recentPositions]
   );
 
-  // Actions
-  const handleConnectWallet = async () => {
-    try {
-      setTxBusy(true);
-      const addr = await connectEvmWallet();
-      setWalletAddress(addr);
-      setStatusMessage(`Connected wallet ${shortAddr(addr)} on HyperEVM`);
-    } catch (err) {
-      setStatusMessage(
-        err instanceof Error ? err.message : 'Wallet connection cancelled'
-      );
-    } finally {
-      setTxBusy(false);
-    }
+  // One synchronous lock for every wallet mutation; stale async work cannot submit.
+  const runAction = async (task: () => Promise<void>) => {
+    if (actionLock.current) return;
+    actionLock.current = true; setTxBusy(true);
+    try { await task(); }
+    catch (error) { setStatusMessage(error instanceof Error ? error.message : 'Action failed.'); }
+    finally { actionLock.current = false; setTxBusy(false); setNow(Date.now()); }
   };
-
-  const handleToggleSessionKey = async () => {
-    if (!walletAddress) {
-      await handleConnectWallet();
-      return;
-    }
-    if (sessionKey) {
-      try {
-        setTxBusy(true);
-        await callOnChainRevokeSessionKey(
-          walletAddress,
-          sessionKey.sessionKeyAddress
-        ).catch(() => null);
-        clearLocalSessionKey(walletAddress);
-        setSessionKey(null);
-        setStatusMessage('1-Click Session Key disabled.');
-      } finally {
-        setTxBusy(false);
-      }
-      return;
-    }
-    try {
-      setTxBusy(true);
-      const created = await createAndSignSessionKey(walletAddress);
-      setSessionKey(created);
-      setStatusMessage('⚡ 1-Click Trading enabled for 30 days!');
-    } catch (err) {
-      setStatusMessage(
-        err instanceof Error ? err.message : 'Could not sign Session Key'
-      );
-    } finally {
-      setTxBusy(false);
-    }
+  const handleConnectWallet = () => runAction(async () => {
+    const addr = await connectEvmWallet();
+    setWalletAddress(addr);
+    setStatusMessage(`Connected ${shortAddr(addr)} on HyperEVM.`);
+  });
+  const requireCurrentAccount = async () => {
+    if (!walletAddress || !accountReady || !protocolReady) throw new Error('Wait for current account data before continuing.');
+    await assertWalletAccount(walletAddress);
+    return walletAddress;
   };
-
-  const handleExecuteTrade = async () => {
-    let activeUser = walletAddress;
-    if (!activeUser) {
-      try {
-        activeUser = await connectEvmWallet();
-        setWalletAddress(activeUser);
-      } catch {
-        return;
-      }
-    }
-    try {
-      setTxBusy(true);
-      const signed = await signPapertradeIntent({
-        action: 'OPEN_POSITION',
-        user: activeUser,
-        sessionKey,
-        builderConfig,
-        instrumentId: selectedCoin === 'BTC' ? 0 : 1,
-        coin: selectedCoin,
-        isLong: isLongSelected,
-        marginUsd: numericMargin,
-        leverage: leverageInput,
-        spendQueuedBalance: spendQueued,
-      });
-      setSignedIntents((prev) => [signed, ...prev.slice(0, 9)]);
-      setStatusMessage(
-        `✓ ${tradeSide} ${selectedCoin} ${leverageInput}x ($${numericMargin}) signed ${
-          signed.signedWithSessionKey ? 'with 1-Click Key' : 'with Wallet'
-        }!`
-      );
-    } catch (err) {
-      setStatusMessage(
-        err instanceof Error ? err.message : 'Trade signing cancelled'
-      );
-    } finally {
-      setTxBusy(false);
-    }
+  const revokeSession = (address: Address) => runAction(async () => {
+    if (!walletAddress) throw new Error('Connect your wallet first.');
+    const owner = walletAddress;
+    const generation = walletGeneration.current;
+    const tx = await callOnChainRevokeSessionKey(owner, address);
+    clearLocalSessionKey(owner, address);
+    if (generation !== walletGeneration.current) return;
+    { setSessionKey(loadStoredSessionKey(owner)); setKnownSessions(sessionMetadata(owner)); }
+    setStatusMessage(`Session revoked on-chain. Transaction: ${tx}`);
+  });
+  const handleToggleSessionKey = () => {
+    if (sessionKey) return revokeSession(sessionKey.sessionKeyAddress);
+    return runAction(async () => {
+      const owner = await requireCurrentAccount();
+      const generation = walletGeneration.current;
+      const key = await createAndSignSessionKey(owner, () => { if (generation !== walletGeneration.current) throw new Error('Wallet changed during authorization.'); });
+      if (generation !== walletGeneration.current) return;
+      setSessionKey(key); setKnownSessions(sessionMetadata(owner));
+      setStatusMessage(key.isOnChainRegistered ? 'Trading session registered. Key remains in this tab only.' : 'Registration submitted; waiting for on-chain authorization.');
+    });
   };
-
-  const handleStakingAction = async (
-    action: 'STAKE_PAPER' | 'UNSTAKE_PAPER' | 'CLAIM_REWARDS'
-  ) => {
-    let activeUser = walletAddress;
-    if (!activeUser) {
-      try {
-        activeUser = await connectEvmWallet();
-        setWalletAddress(activeUser);
-      } catch {
-        return;
-      }
-    }
-    try {
-      setTxBusy(true);
-      const signed = await signPapertradeIntent({
-        action,
-        user: activeUser,
-        sessionKey,
-        builderConfig,
-        amountPaper: parseFloat(stakeAmountInput) || 0,
-      });
-      setSignedIntents((prev) => [signed, ...prev.slice(0, 9)]);
-      setStatusMessage(`✓ ${action.replace('_', ' ')} intent signed!`);
-    } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Action cancelled');
-    } finally {
-      setTxBusy(false);
-    }
+  const submitSigned = async (signed: SignedTradeIntent, generation: number) => {
+    if (generation !== walletGeneration.current) throw new Error('Wallet changed. Review the action again.');
+    setSignedIntents(prev => [signed, ...prev.slice(0, 9)]);
+    const result = await executeSignedIntent(signed);
+    if (generation !== walletGeneration.current) return;
+    setSignedIntents(prev => [result, ...prev.filter(i => i.id !== result.id).slice(0, 9)]);
+    setStatusMessage(`Request ${result.relayerStatus}. ${result.relayerStatus === 'confirmed' ? 'Relayer reports execution; refreshing on-chain data.' : 'Acceptance is not execution. Review the official account activity before another submission.'}`);
+    await refreshOnChain();
   };
-
-  const handleHarvestQueue = async () => {
-    let activeUser = walletAddress;
-    if (!activeUser) {
-      try {
-        activeUser = await connectEvmWallet();
-        setWalletAddress(activeUser);
-      } catch {
-        return;
-      }
+  const handleExecuteTrade = () => runAction(async () => {
+    if (tradeReason) throw new Error(tradeReason);
+    const generation = walletGeneration.current;
+    const owner = await requireCurrentAccount();
+    const signed = await signPapertradeIntent({ action: 'OPEN_POSITION', user: owner, sessionKey: sessionReady ? sessionKey : null, instrumentId: selectedCoin === 'BTC' ? 0 : 1, coin: selectedCoin, isLong: isLongSelected, marginUsd: marginInput, leverage: leverageInput, spendQueuedBalance: spendQueued });
+    if (!isFresh(activeBbo.timestamp, PRICE_MAX_AGE_MS)) throw new Error('Quote expired while signing. Review current prices before trying again.');
+    await submitSigned(signed, generation);
+  });
+  const handleClosePosition = (position: OnChainPosition) => runAction(async () => {
+    const generation = walletGeneration.current;
+    const owner = await requireCurrentAccount();
+    if (!canSubmit || !position.isOpen || position.user.toLowerCase() !== owner.toLowerCase()) throw new Error('This position cannot be closed from the current account.');
+    const signed = await signPapertradeIntent({ action: 'CLOSE_POSITION', user: owner, sessionKey: sessionReady ? sessionKey : null, positionId: position.id });
+    await submitSigned(signed, generation);
+  });
+  const handleStakingAction = (action: 'STAKE_PAPER' | 'UNSTAKE_PAPER' | 'CLAIM_REWARDS') => runAction(async () => {
+    const generation = walletGeneration.current;
+    const owner = await requireCurrentAccount();
+    if (!canSubmit) throw new Error('Staking submission is unavailable. Resolve pending requests first.');
+    if (action !== 'CLAIM_REWARDS') {
+      const amount = parseAmount(stakeAmountInput);
+      if (amount > (action === 'STAKE_PAPER' ? userState.paperRaw : userState.stakedRaw)) throw new Error('Amount exceeds the available PAPER balance.');
     }
-    try {
-      setTxBusy(true);
-      setStatusMessage('Calling Exchange.harvest(32) on HyperEVM...');
-      const tx = await callOnChainHarvest(activeUser, 32n);
-      setStatusMessage(`Queue harvested! Tx: ${shortAddr(tx)}`);
-      refreshOnChain();
-    } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Harvest failed');
-    } finally {
-      setTxBusy(false);
-    }
-  };
-
+    const signed = await signPapertradeIntent({ action, user: owner, sessionKey: null, amountPaper: stakeAmountInput });
+    await submitSigned(signed, generation);
+  });
+  const directAction = (label: string, action: (owner: Address) => Promise<string>) => runAction(async () => {
+    const owner = await requireCurrentAccount();
+    const tx = await action(owner);
+    setStatusMessage(`${label} confirmed. Transaction: ${tx}`);
+    await refreshOnChain();
+  });
+  const handleHarvestQueue = () => directAction('Harvest', owner => callOnChainHarvest(owner, 32n));
   const lpFillPct = Math.min(
     100,
-    Math.max(5, (protocol.trackedLpUsd / 5_000_000) * 100)
+    Math.max(0, (protocol.trackedLpUsd / 5_000_000) * 100)
   );
 
   const renderSimplePositionCard = (pos: OnChainPosition) => {
+    const quote = bbo[pos.coin];
     const liveMark =
       pos.coin === 'BTC'
         ? bbo.BTC.mid || pos.entryPrice
@@ -366,22 +333,19 @@ export const App: React.FC = () => {
               color: pnl.netPnlUsd >= 0 ? '#34d399' : '#fb7185',
             }}
           >
-            {pnl.netPnlUsd >= 0 ? '+' : ''}${fmtUsd(pnl.netPnlUsd, 2)} (
-            {pnl.netRoePct.toFixed(0)}%)
+            {isFresh(quote.timestamp, PRICE_MAX_AGE_MS, now) && bbo.wsConnected ? `Est. ${pnl.netPnlUsd >= 0 ? '+' : ''}$${fmtUsd(pnl.netPnlUsd, 2)} (${pnl.netRoePct.toFixed(0)}%)` : 'PnL unavailable (stale quote)'}
           </div>
           <div style={{ fontSize: 11, color: '#94a3b8' }}>
             ${fmtUsd(pos.marginUsd, 0)} margin
           </div>
-          {pnl.isBust && (
+          {pos.isOpen && pos.user.toLowerCase() === walletAddress?.toLowerCase() && (
             <button
               className="btn btn-red"
               style={{ padding: '2px 7px', fontSize: 10, marginTop: 3 }}
-              onClick={() =>
-                walletAddress &&
-                callOnChainLiquidate(walletAddress, BigInt(pos.id))
-              }
+              onClick={() => handleClosePosition(pos)}
+              disabled={txBusy || !canSubmit}
             >
-              Liquidate
+              Close position
             </button>
           )}
         </div>
@@ -391,6 +355,13 @@ export const App: React.FC = () => {
 
   return (
     <div>
+      <div role="status" className="data-status">
+        {bbo.historyError && <p>{bbo.historyError}</p>}
+        {!RELAYER_URL && <p>Trading disabled: an approved relayer connection is required. <a href="https://exchange.papertrade.xyz" target="_blank" rel="noopener noreferrer">Trade on the official site</a>.</p>}
+        {!protocolReady && <p>On-chain data unavailable or stale: {protocol.error ?? 'synchronizing'}. Displayed values may be incomplete.</p>}
+        {!priceReady && <p>Live quote unavailable or stale. Price previews are disabled.</p>}
+        {storageError && <p>{storageError}</p>}
+      </div>
       {/* 1. CLEAN TOP BAR */}
       <header className="top-nav">
         <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
@@ -426,13 +397,13 @@ export const App: React.FC = () => {
           <span style={{ fontSize: 12, color: '#94a3b8' }}>{statusMessage}</span>
 
           <button
-            className={`btn ${sessionKey ? 'btn-green' : ''}`}
+            className={`btn ${sessionReady ? 'btn-green' : ''}`}
             onClick={handleToggleSessionKey}
-            disabled={txBusy}
-            title="Enable 1-click trading for 30 days with zero wallet popups"
+            disabled={txBusy || (!sessionKey && !canSubmit)}
+            title="Authorize a trading-only key held in this tab; reload requires reauthorization"
           >
             <Zap size={14} />
-            {sessionKey ? '1-Click Mode: ON' : 'Enable 1-Click Mode'}
+            {sessionKey ? sessionReady ? 'Revoke 1-Click Session' : 'Revoke Pending Session' : 'Enable 1-Click Mode'}
           </button>
 
           <button
@@ -507,7 +478,7 @@ export const App: React.FC = () => {
             midPrice={currentMid}
             bid={activeBbo.bid || currentMid}
             ask={activeBbo.ask || currentMid}
-            changePct={activeBbo.change24hPct}
+            changePct={activeBbo.changePct}
             history={activeBbo.history}
             entryPrice={preview.entryPrice}
             bustPrice={preview.bustPrice}
@@ -583,7 +554,7 @@ export const App: React.FC = () => {
                       <span className="floor-badge">3F • ROOFTOP</span>
                       <strong>🍸 VIP $PAPER Stakers&apos; Lounge</strong>
                       <span style={{ fontSize: 12, color: '#94a3b8' }}>
-                        Stakers earn 1% of all winning trade volume in USDC
+                        Stakers receive a share of fees on winning profits in USDC
                       </span>
                     </div>
                     <span style={{ fontSize: 12, color: '#34d399', fontWeight: 600 }}>
@@ -627,31 +598,28 @@ export const App: React.FC = () => {
                       <button
                         className="btn btn-green"
                         onClick={() => handleStakingAction('STAKE_PAPER')}
-                        disabled={txBusy}
+                        disabled={txBusy || !canSubmit}
                       >
                         Stake
                       </button>
                       <button
                         className="btn"
                         onClick={() => handleStakingAction('UNSTAKE_PAPER')}
-                        disabled={txBusy}
+                        disabled={txBusy || !canSubmit}
                       >
                         Unstake
                       </button>
                       <button
                         className="btn btn-gold"
                         onClick={() => handleStakingAction('CLAIM_REWARDS')}
-                        disabled={txBusy}
+                        disabled={txBusy || !canSubmit}
                       >
                         Claim USDC
                       </button>
                       <button
                         className="btn"
-                        onClick={() =>
-                          walletAddress &&
-                          callOnChainPushStakerFees(walletAddress)
-                        }
-                        disabled={txBusy}
+                        onClick={() => directAction('Staker fees', callOnChainPushStakerFees)}
+                        disabled={txBusy || !accountReady || !protocolReady}
                         title="Flush accumulated win fees into staking pool"
                       >
                         <Coins size={13} /> Flush Fees ($
@@ -801,7 +769,7 @@ export const App: React.FC = () => {
                       <button
                         className="btn btn-gold"
                         onClick={handleHarvestQueue}
-                        disabled={txBusy}
+                        disabled={txBusy || !accountReady || !protocolReady}
                         title="Calls Exchange.harvest(32) to pay out waiting traders"
                       >
                         <Bell size={13} /> Ring Cashier Bell (Harvest Queue)
@@ -839,8 +807,7 @@ export const App: React.FC = () => {
 
                     {protocol.activeQueueNodes.map((node) => {
                       const isWaiting =
-                        node.id >= protocol.queueHead &&
-                        protocol.totalQueuedUsd > 0;
+                                                protocol.totalQueuedUsd > 0;
                       return (
                         <div
                           key={node.id}
@@ -902,25 +869,15 @@ export const App: React.FC = () => {
                           <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
                             <button
                               className="pill-btn"
-                              onClick={() =>
-                                walletAddress &&
-                                callOnChainRequestSweep(
-                                  walletAddress,
-                                  walletAddress
-                                )
-                              }
+                              onClick={() => directAction('Sweep request', owner => callOnChainRequestSweep(owner, owner))}
+                              disabled={txBusy || !accountReady || !protocolReady}
                             >
                               <Truck size={11} /> Sweep
                             </button>
                             <button
                               className="pill-btn"
-                              onClick={() =>
-                                walletAddress &&
-                                callOnChainFinalizeSweep(
-                                  walletAddress,
-                                  walletAddress
-                                )
-                              }
+                              onClick={() => directAction('Sweep finalization', owner => callOnChainFinalizeSweep(owner, owner))}
+                              disabled={txBusy || !accountReady || !protocolReady}
                             >
                               Finalize
                             </button>
@@ -946,7 +903,7 @@ export const App: React.FC = () => {
                       <span className="floor-badge">B1 • BASEMENT</span>
                       <strong>🖨️ The $PAPER Printing Press (Loss Mining)</strong>
                       <span style={{ fontSize: 12, color: '#94a3b8' }}>
-                        Every $1 lost in the pit automatically prints{' '}
+                        Current marginal emission rate per eligible loss dollar:{' '}
                         <strong style={{ color: '#4ade80' }}>
                           {protocol.marginalMintRate.toFixed(2)} $PAPER
                         </strong>{' '}
@@ -955,7 +912,7 @@ export const App: React.FC = () => {
                     </div>
                     <span style={{ fontSize: 12, color: '#4ade80', fontWeight: 600 }}>
                       Total Minted: {(protocol.paperTotalSupply / 1e6).toFixed(2)}M
-                      / 100M PAPER
+                      PAPER
                     </span>
                   </div>
 
@@ -974,7 +931,7 @@ export const App: React.FC = () => {
                     <PixelPrintingPress active={true} />
 
                     {closedPitPositions.slice(0, 6).map((pos) => {
-                      const minted = pos.marginUsd * protocol.marginalMintRate;
+                      // Realized emission amounts require settlement events, not current rates.
                       return (
                         <div
                           key={pos.id}
@@ -1006,7 +963,7 @@ export const App: React.FC = () => {
                                 color: '#4ade80',
                               }}
                             >
-                              +{fmtUsd(minted, 1)} PAPER
+                              Closed — settlement not indexed
                             </div>
                           </div>
                         </div>
@@ -1159,17 +1116,17 @@ export const App: React.FC = () => {
                 </strong>
               </div>
               <div className="summary-line">
-                <span>Bust (Liquidation) Price</span>
+                <span>Approximate Bust Price</span>
                 <strong style={{ color: '#fb7185' }}>
                   ${fmtUsd(preview.bustPrice, selectedCoin === 'BTC' ? 1 : 2)}
                 </strong>
               </div>
               <div className="summary-line">
                 <span>Win Fee (Only if Profitable)</span>
-                <strong>2.0% of Profit</strong>
+                <strong>Impact haircut + 2% of adjusted profit</strong>
               </div>
               <div className="summary-line">
-                <span>If Liquidated, You Receive</span>
+                <span>Estimated PAPER on full loss</span>
                 <strong style={{ color: '#34d399' }}>
                   +{fmtUsd(preview.paperRewardOnLoss, 1)} $PAPER
                 </strong>
@@ -1198,6 +1155,7 @@ export const App: React.FC = () => {
               </span>
             </label>
 
+            {tradeReason && <p role="status" style={{ color: '#facc15', marginBottom: 12 }}>{tradeReason}</p>}
             {/* 5. BIG ACTION BUTTON */}
             <button
               className={`btn ${
@@ -1210,7 +1168,7 @@ export const App: React.FC = () => {
                 fontWeight: 700,
               }}
               onClick={handleExecuteTrade}
-              disabled={txBusy}
+              disabled={txBusy || !!tradeReason}
             >
               {tradeSide === 'LONG' ? '🟢 BUY / LONG' : '🔴 SELL / SHORT'}{' '}
               {selectedCoin} ({leverageInput}×)
@@ -1245,6 +1203,23 @@ export const App: React.FC = () => {
               </div>
             </div>
 
+            <section style={{ marginTop: 14 }} aria-label="Your open positions">
+              <h3>Your open positions</h3>
+              {!accountReady ? <p>Waiting for current account data…</p> : userState.openPositions.length === 0 ? <p>No open BTC/ETH positions.</p> : userState.openPositions.map(renderSimplePositionCard)}
+            </section>
+            {knownSessions.length > 0 && <section style={{ marginTop: 14 }} aria-label="Session revocation">
+              <h3>Authorized or pending session keys</h3>
+              <p>Keys stay in this tab only. Public addresses are retained so you can revoke after reload.</p>
+              {knownSessions.map(key => <button key={key.sessionKeyAddress} className="btn" disabled={txBusy} onClick={() => revokeSession(key.sessionKeyAddress)}>Revoke {shortAddr(key.sessionKeyAddress)}</button>)}
+            </section>}
+            {pending && walletAddress && <section role="status" style={{ marginTop: 14 }}>
+              <p>A submission is unresolved. Check <a href="https://exchange.papertrade.xyz" target="_blank" rel="noopener noreferrer">official account activity</a> before another request.</p>
+              <button className="btn" disabled={txBusy} onClick={async () => {
+                if (window.confirm('Have you verified that every pending request has executed, failed, or been cancelled? Clearing this record does not cancel a request.')) {
+                  try { await acknowledgePending(walletAddress); setNow(Date.now()); } catch { setStatusMessage('Could not update submission history.'); }
+                }
+              }}>I verified the outcome</button>
+            </section>}
             {/* Collapsible Builder Code & Signed Payload Inspector */}
             <details style={{ marginTop: 12, fontSize: 12, color: '#94a3b8' }}>
               <summary
@@ -1258,17 +1233,13 @@ export const App: React.FC = () => {
                 }}
               >
                 <span>
-                  Builder Code Attribution ({builderConfig.builderCode})
+                  Signed request details
                 </span>
                 <ChevronDown size={14} />
               </summary>
               <div style={{ marginTop: 8 }}>
                 <p style={{ fontSize: 11, marginBottom: 6 }}>
-                  Every signed trade automatically tags{' '}
-                  <code style={{ color: '#38bdf8' }}>
-                    {builderConfig.builderCode}
-                  </code>{' '}
-                  (1% LP fee share, 0 extra cost to user).
+                  Builder attribution is not live and is not included in signatures.
                 </p>
                 {signedIntents.length > 0 && (
                   <div>
@@ -1279,15 +1250,15 @@ export const App: React.FC = () => {
                         marginBottom: 4,
                       }}
                     >
-                      <span>Latest Signed Payload:</span>
+                      <span>Latest signed request (not proof of execution):</span>
                       <button
                         className="pill-btn"
-                        onClick={() => {
-                          navigator.clipboard.writeText(
+                        onClick={async () => {
+                          try { await navigator.clipboard.writeText(
                             signedIntents[0].typedDataJson
                           );
                           setCopiedId(signedIntents[0].id);
-                          setTimeout(() => setCopiedId(null), 1500);
+                          setTimeout(() => setCopiedId(null), 1500); } catch { setStatusMessage('Clipboard unavailable. Select and copy the JSON manually.'); }
                         }}
                       >
                         {copiedId === signedIntents[0].id ? (
@@ -1325,3 +1296,4 @@ export const App: React.FC = () => {
     </div>
   );
 };
+

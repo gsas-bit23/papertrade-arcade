@@ -1,288 +1,76 @@
-import {
-  Address,
-  Hex,
-  createWalletClient,
-  custom,
-  parseUnits,
-} from 'viem';
+import { createWalletClient, custom, recoverTypedDataAddress, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { hyperEvmChain, publicClient } from '../config/chain';
-import {
-  PAPERTRADE_CONTRACTS,
-  EXCHANGE_ABI,
-  DEPOSIT_PROXY_FACTORY_ABI,
-  SESSION_KEY_MANAGER_ABI,
-} from '../config/contracts';
-import { BuilderCodeConfig } from '../config/builderCode';
-import { StoredSessionKey } from './sessionKeys';
-
-export type IntentActionType =
-  | 'OPEN_POSITION'
-  | 'CLOSE_POSITION'
-  | 'STAKE_PAPER'
-  | 'UNSTAKE_PAPER'
-  | 'CLAIM_REWARDS';
-
+import { PAPERTRADE_CONTRACTS, EXCHANGE_ABI, SESSION_KEY_MANAGER_ABI } from '../config/contracts';
+import type { BuilderCodeConfig } from '../config/builderCode';
+import { validateSessionKey, type StoredSessionKey } from './sessionKeys';
+import { assertWalletAccount, getEthereum, ensureHyperEvmNetwork } from './wallet';
+import { computeIntentId, INTENT_TYPES, intentDomain, newNonce, parseAmount, signedWire, wireMessage, type PrimaryType, type ProtocolAction } from './protocolIntents';
+import { requireRelayer, hasPendingIntent, submitIntent, type SubmissionState } from './relayer';
+export { connectEvmWallet } from './wallet';
+export type IntentActionType = 'OPEN_POSITION' | 'CLOSE_POSITION' | 'STAKE_PAPER' | 'UNSTAKE_PAPER' | 'CLAIM_REWARDS';
 export interface SignedTradeIntent {
-  id: string;
-  action: IntentActionType;
-  user: Address;
-  signerAddress: Address;
-  signedWithSessionKey: boolean;
-  instrumentId?: number;
-  coin?: 'BTC' | 'ETH';
-  isLong?: boolean;
-  marginUsd?: string;
-  leverage?: number;
-  spendQueuedBalance?: boolean;
-  positionId?: number;
-  amountPaper?: string;
-  nonce: number;
-  deadline: number;
-  builderCode: string;
-  builderFeeShareBps: number;
-  signature: Hex;
-  typedDataJson: string;
-  relayerStatus: 'SIGNED_READY' | 'RELAYED' | 'RELAYER_OFFLINE_SAVED';
-  createdAt: number;
+  id: Hex; action: IntentActionType; user: Address; signerAddress: Address;
+  signedWithSessionKey: boolean; signature: Hex; typedDataJson: string;
+  deadline: number; createdAt: number; relayerStatus: SubmissionState;
+  protocolAction: ProtocolAction; signed: Record<string, unknown>;
 }
-
-type EthereumProvider = {
-  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+const actions: Record<IntentActionType, [PrimaryType, ProtocolAction]> = {
+  OPEN_POSITION: ['OpenPosition', 'openPosition'], CLOSE_POSITION: ['Close', 'closePositions'],
+  STAKE_PAPER: ['Stake', 'paperStake'], UNSTAKE_PAPER: ['Unstake', 'paperUnstake'], CLAIM_REWARDS: ['Claim', 'paperClaim'],
 };
-
-function getEthereum(): EthereumProvider {
-  const eth = (window as unknown as { ethereum?: EthereumProvider }).ethereum;
-  if (!eth) {
-    throw new Error('No injected EVM wallet found. Please open Rabby or MetaMask.');
-  }
-  return eth;
-}
-
-export async function ensureHyperEvmNetwork(): Promise<void> {
-  const eth = getEthereum();
-  const chainIdHex = (await eth.request({ method: 'eth_chainId' })) as string;
-  if (parseInt(chainIdHex, 16) !== hyperEvmChain.id) {
-    try {
-      await eth.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: '0x3e7' }], // 999 in hex
-      });
-    } catch (switchErr: unknown) {
-      const code = (switchErr as { code?: number })?.code;
-      if (code === 4902) {
-        await eth.request({
-          method: 'wallet_addEthereumChain',
-          params: [
-            {
-              chainId: '0x3e7',
-              chainName: 'HyperEVM',
-              nativeCurrency: { name: 'HYPE', symbol: 'HYPE', decimals: 18 },
-              rpcUrls: ['https://rpc.hyperliquid.xyz/evm'],
-              blockExplorerUrls: ['https://hyperevmscan.io'],
-            },
-          ],
-        });
-      } else {
-        throw switchErr;
-      }
-    }
-  }
-}
-
-export async function connectEvmWallet(): Promise<Address> {
-  const eth = getEthereum();
-  const accounts = (await eth.request({
-    method: 'eth_requestAccounts',
-  })) as Address[];
-  if (!accounts || accounts.length === 0) {
-    throw new Error('No wallet account authorized.');
-  }
-  await ensureHyperEvmNetwork();
-  return accounts[0];
-}
-
-/**
- * Signs an off-chain Papertrade Intent using either the 1-Click 30-Day Session Key
- * (instant, zero wallet popup) or the user's primary EVM wallet, and attaches the
- * Phase 3 `builderCode` attribution field.
- */
 export async function signPapertradeIntent(params: {
-  action: IntentActionType;
-  user: Address;
-  sessionKey: StoredSessionKey | null;
-  builderConfig: BuilderCodeConfig;
-  instrumentId?: number;
-  coin?: 'BTC' | 'ETH';
-  isLong?: boolean;
-  marginUsd?: number;
-  leverage?: number;
-  spendQueuedBalance?: boolean;
-  positionId?: number;
-  amountPaper?: number;
+  action: IntentActionType; user: Address; sessionKey: StoredSessionKey | null;
+  builderConfig?: BuilderCodeConfig; instrumentId?: number; coin?: 'BTC' | 'ETH';
+  isLong?: boolean; marginUsd?: string; leverage?: number; spendQueuedBalance?: boolean;
+  positionId?: string; amountPaper?: string;
 }): Promise<SignedTradeIntent> {
-  const nonce = Math.floor(Date.now());
-  const deadline = Math.floor(Date.now() / 1000) + 300; // 5 min intent TTL
-
-  const domain = {
-    name: 'PapertradeExchange',
-    version: '1',
-    chainId: hyperEvmChain.id,
-    verifyingContract: PAPERTRADE_CONTRACTS.Exchange,
-  } as const;
-
-  const types = {
-    PapertradeIntent: [
-      { name: 'action', type: 'string' },
-      { name: 'user', type: 'address' },
-      { name: 'instrumentId', type: 'uint32' },
-      { name: 'isLong', type: 'bool' },
-      { name: 'marginWei', type: 'uint256' },
-      { name: 'leverage', type: 'uint16' },
-      { name: 'spendQueuedBalance', type: 'bool' },
-      { name: 'positionId', type: 'uint256' },
-      { name: 'nonce', type: 'uint256' },
-      { name: 'deadline', type: 'uint64' },
-      { name: 'builderCode', type: 'string' },
-    ],
-  } as const;
-
-  const marginWei = parseUnits((params.marginUsd ?? params.amountPaper ?? 0).toString(), 18);
-
-  const message = {
-    action: params.action,
-    user: params.user,
-    instrumentId: params.instrumentId ?? 0,
-    isLong: Boolean(params.isLong),
-    marginWei,
-    leverage: params.leverage ?? 1000,
-    spendQueuedBalance: Boolean(params.spendQueuedBalance),
-    positionId: BigInt(params.positionId ?? 0),
-    nonce: BigInt(nonce),
-    deadline: BigInt(deadline),
-    builderCode: params.builderConfig.enabled ? params.builderConfig.builderCode : '',
-  };
-
+  requireRelayer();
+  await assertWalletAccount(params.user);
+  if (hasPendingIntent(params.user)) throw new Error('Review the unresolved request before signing another action.');
+  const [primaryType, protocolAction] = actions[params.action];
+  const deadline = Math.floor(Date.now() / 1000) + 300;
+  const message: Record<string, unknown> = { user: params.user, nonce: newNonce(), deadline: BigInt(deadline) };
+  if (primaryType === 'OpenPosition') {
+    if (![0, 1].includes(params.instrumentId ?? -1) || !Number.isInteger(params.leverage) || params.leverage! < 1 || params.leverage! > 1000 || typeof params.isLong !== 'boolean') throw new Error('Invalid market, direction, or leverage.');
+    Object.assign(message, { instrumentId: params.instrumentId, isLong: params.isLong, size: parseAmount(params.marginUsd ?? '', 128), leverage: params.leverage, useDebt: Boolean(params.spendQueuedBalance) });
+  } else if (primaryType === 'Close') {
+    if (!/^[1-9]\d*$/.test(params.positionId ?? '') || BigInt(params.positionId!) >= 1n << 256n) throw new Error('Invalid position ID.');
+    message.positionIds = [BigInt(params.positionId!)];
+  } else if (primaryType === 'Stake' || primaryType === 'Unstake') message.amount = parseAmount(params.amountPaper ?? '');
+  const typed = { domain: intentDomain(primaryType), types: { [primaryType]: INTENT_TYPES[primaryType] }, primaryType, message };
+  // Staking is ALWAYS owner-authorized, even when a trading session exists.
+  const key = primaryType === 'OpenPosition' || primaryType === 'Close' ? params.sessionKey : null;
   let signature: Hex;
-  let signerAddress: Address;
-  let signedWithSessionKey = false;
-
-  if (params.sessionKey) {
-    // 1-Click instant signing in-memory with the 30-day Session Key!
-    const skAccount = privateKeyToAccount(params.sessionKey.privateKey);
-    signature = await skAccount.signTypedData({
-      domain,
-      types,
-      primaryType: 'PapertradeIntent',
-      message,
-    });
-    signerAddress = skAccount.address;
-    signedWithSessionKey = true;
+  let signerAddress = params.user;
+  if (key) {
+    await validateSessionKey(key, params.user, deadline);
+    const account = privateKeyToAccount(key.privateKey);
+    signature = await account.signTypedData(typed);
+    signerAddress = account.address;
   } else {
-    // Fallback to wallet popup EIP-712 signature
-    await ensureHyperEvmNetwork();
-    const eth = getEthereum();
-    const jsonPayload = JSON.stringify(
-      {
-        domain,
-        types: {
-          EIP712Domain: [
-            { name: 'name', type: 'string' },
-            { name: 'version', type: 'string' },
-            { name: 'chainId', type: 'uint256' },
-            { name: 'verifyingContract', type: 'address' },
-          ],
-          ...types,
-        },
-        primaryType: 'PapertradeIntent',
-        message: {
-          ...message,
-          marginWei: message.marginWei.toString(),
-          positionId: message.positionId.toString(),
-          nonce: message.nonce.toString(),
-          deadline: message.deadline.toString(),
-        },
-      },
-      null,
-      2
-    );
-    signature = (await eth.request({
-      method: 'eth_signTypedData_v4',
-      params: [params.user, jsonPayload],
-    })) as Hex;
-    signerAddress = params.user;
+    const client = await getWalletClient(params.user);
+    signature = await client.signTypedData(typed);
   }
-
-  const typedDataJson = JSON.stringify(
-    {
-      intent: {
-        action: params.action,
-        user: params.user,
-        signer: signerAddress,
-        signedWithSessionKey,
-        instrument: params.coin ?? 'BTC',
-        isLong: params.isLong,
-        marginUsd: params.marginUsd,
-        leverage: params.leverage,
-        spendQueuedBalance: params.spendQueuedBalance,
-        positionId: params.positionId,
-        nonce,
-        deadline,
-      },
-      builderAttribution: {
-        builderCode: params.builderConfig.builderCode,
-        feeShareBps: params.builderConfig.feeShareBps,
-        activeOnChain: params.builderConfig.phase3Live,
-      },
-      sessionKeyAuth: params.sessionKey
-        ? {
-            sessionKey: params.sessionKey.sessionKeyAddress,
-            expiry: params.sessionKey.expiry,
-            ownerRegistrationSig: params.sessionKey.registrationSignature,
-          }
-        : null,
-      signature,
-    },
-    null,
-    2
-  );
-
-  return {
-    id: `intent-${nonce}`,
-    action: params.action,
-    user: params.user,
-    signerAddress,
-    signedWithSessionKey,
-    instrumentId: params.instrumentId,
-    coin: params.coin,
-    isLong: params.isLong,
-    marginUsd: params.marginUsd?.toFixed(2),
-    leverage: params.leverage,
-    spendQueuedBalance: params.spendQueuedBalance,
-    positionId: params.positionId,
-    amountPaper: params.amountPaper?.toFixed(2),
-    nonce,
-    deadline,
-    builderCode: params.builderConfig.builderCode,
-    builderFeeShareBps: params.builderConfig.feeShareBps,
-    signature,
-    typedDataJson,
-    relayerStatus: 'SIGNED_READY',
-    createdAt: Date.now(),
-  };
+  await assertWalletAccount(params.user);
+  if (deadline <= Date.now() / 1000) throw new Error('Signing took too long. Review and sign again.');
+  if ((await recoverTypedDataAddress({ ...typed, signature })).toLowerCase() !== signerAddress.toLowerCase()) throw new Error('Unexpected signature signer.');
+  return { id: computeIntentId(primaryType, message, signerAddress), action: params.action, user: params.user, signerAddress, signedWithSessionKey: !!key, signature,
+    typedDataJson: JSON.stringify({ ...typed, message: wireMessage(primaryType, message), signature }, null, 2),
+    deadline, createdAt: Date.now(), relayerStatus: 'signed', protocolAction, signed: signedWire(primaryType, message, signature) };
+}
+export async function executeSignedIntent(intent: SignedTradeIntent): Promise<SignedTradeIntent> {
+  await assertWalletAccount(intent.user);
+  const state = await submitIntent({ id: intent.id, user: intent.user, action: intent.protocolAction, deadline: intent.deadline, state: 'signed' }, intent.signed);
+  return { ...intent, relayerStatus: state };
+}
+export function assertSuccessfulReceipt(receipt: { status: string }) {
+  if (receipt.status !== 'success') throw new Error('Transaction reverted on-chain. No successful execution was confirmed.');
 }
 
-/**
- * Direct on-chain transactions on HyperEVM (Chain 999) for permissionless
- * protocol cranks & user self-service functions:
- * - harvest(maxIterations) on Exchange (drains FIFO Queue using LP Bankroll)
- * - pushStakerFees() on Exchange (flushes accumulated staker fees to PaperStaking)
- * - requestSweep(user) / finalizeSweep(user) on DepositProxyFactory
- * - liquidate(posId) on Exchange
- * - revokeSessionKey(sessionKey) on SessionKeyManager
- */
 async function getWalletClient(account: Address) {
   await ensureHyperEvmNetwork();
+  await assertWalletAccount(account);
   const eth = getEthereum();
   return createWalletClient({
     account,
@@ -302,7 +90,8 @@ export async function callOnChainHarvest(
     functionName: 'harvest',
     args: [maxIterations],
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  assertSuccessfulReceipt(receipt);
   return hash;
 }
 
@@ -313,7 +102,8 @@ export async function callOnChainPushStakerFees(account: Address): Promise<Hex> 
     abi: EXCHANGE_ABI,
     functionName: 'pushStakerFees',
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  assertSuccessfulReceipt(receipt);
   return hash;
 }
 
@@ -328,7 +118,8 @@ export async function callOnChainRequestSweep(
     functionName: 'requestSweep',
     args: [targetUser],
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  assertSuccessfulReceipt(receipt);
   return hash;
 }
 
@@ -343,7 +134,8 @@ export async function callOnChainFinalizeSweep(
     functionName: 'finalizeSweep',
     args: [targetUser],
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  assertSuccessfulReceipt(receipt);
   return hash;
 }
 
@@ -358,7 +150,8 @@ export async function callOnChainLiquidate(
     functionName: 'liquidate',
     args: [posId],
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  assertSuccessfulReceipt(receipt);
   return hash;
 }
 
@@ -373,6 +166,8 @@ export async function callOnChainRevokeSessionKey(
     functionName: 'revokeSessionKey',
     args: [sessionKey],
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  assertSuccessfulReceipt(receipt);
   return hash;
 }
+

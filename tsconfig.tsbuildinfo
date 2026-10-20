@@ -1,1 +1,0 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/blockchain/intentbuilder.ts","./src/blockchain/sessionkeys.ts","./src/components/livepricechart.tsx","./src/components/pixelsprites.tsx","./src/config/buildercode.ts","./src/config/chain.ts","./src/config/contracts.ts","./src/engine/hyperliquidws.ts","./src/engine/onchainfeed.ts","./src/engine/papertrademath.ts"],"version":"5.6.3"}

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Address, formatUnits } from 'viem';
 import { publicClient } from '../config/chain';
 import {
@@ -10,10 +10,11 @@ import {
   DEPOSIT_PROXY_FACTORY_ABI,
   ERC20_ABI,
 } from '../config/contracts';
-import { computeMarginalMintRate } from './papertradeMath';
+import { assertReadSuccess, sumUserQueue } from './safety';
+import { computeMarginalMintRate, INSTRUMENTS } from './papertradeMath';
 
 export interface OnChainPosition {
-  id: number;
+  id: string;
   user: Address;
   instrumentId: number; // 0 = BTC, 1 = ETH
   coin: 'BTC' | 'ETH';
@@ -70,7 +71,14 @@ export interface UserOnChainState {
   paperBalance: number;
   stakedPaper: number;
   pendingRewardUsd: number;
-  openPositionIds: number[];
+  openPositionIds: string[];
+  balanceRaw: bigint;
+  queuedRaw: bigint;
+  executableQueuedRaw: bigint;
+  paperRaw: bigint;
+  stakedRaw: bigint;
+  lastUpdatedMs: number;
+  error: string | null;
   openPositions: OnChainPosition[];
   computedProxyAddress: Address | null;
   deployedProxyAddress: Address | null;
@@ -87,7 +95,10 @@ const toUsdc6 = (val: unknown): number => {
   return parseFloat(formatUnits(val, 6));
 };
 
+const emptyUser = (): UserOnChainState => ({ address: null, exchangeBalanceUsd: 0, queuedAmountUsd: 0, userQueueHead: 0, walletUsdcBalance: 0, paperBalance: 0, stakedPaper: 0, pendingRewardUsd: 0, openPositionIds: [], openPositions: [], computedProxyAddress: null, deployedProxyAddress: null, proxyUsdcBalance: 0, balanceRaw: 0n, queuedRaw: 0n, executableQueuedRaw: 0n, paperRaw: 0n, stakedRaw: 0n, lastUpdatedMs: 0, error: null });
 export function usePapertradeOnChainFeed(userAddress: Address | null) {
+  const generation = useRef(0);
+  const running = useRef<Promise<void> | null>(null);
   const [protocol, setProtocol] = useState<ProtocolOnChainState>({
     blockNumber: 0n,
     treasuryUsd: 0,
@@ -115,23 +126,9 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
     lastUpdatedMs: 0,
   });
 
-  const [userState, setUserState] = useState<UserOnChainState>({
-    address: null,
-    exchangeBalanceUsd: 0,
-    queuedAmountUsd: 0,
-    userQueueHead: 0,
-    walletUsdcBalance: 0,
-    paperBalance: 0,
-    stakedPaper: 0,
-    pendingRewardUsd: 0,
-    openPositionIds: [],
-    openPositions: [],
-    computedProxyAddress: null,
-    deployedProxyAddress: null,
-    proxyUsdcBalance: 0,
-  });
+  const [userState, setUserState] = useState<UserOnChainState>(emptyUser);
 
-  const parsePositionTuple = (id: number, raw: unknown): OnChainPosition | null => {
+  const parsePositionTuple = (id: string, raw: unknown): OnChainPosition | null => {
     if (!Array.isArray(raw) || raw.length < 9) return null;
     const [
       user,
@@ -146,12 +143,13 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
     ] = raw;
     if (!user || user === '0x0000000000000000000000000000000000000000') return null;
     const instNum = Number(instrumentId);
+    if (instNum !== 0 && instNum !== 1) return null;
     return {
       id,
       user: user as Address,
       instrumentId: instNum,
       coin: instNum === 1 ? 'ETH' : 'BTC',
-      entryPrice: Number(entryPriceRaw) / 10,
+      entryPrice: Number(entryPriceRaw) / INSTRUMENTS[instNum === 1 ? 'ETH' : 'BTC'].priceDecimalsOnChain,
       marginUsd: toUsd18(marginRaw),
       leverage: Number(leverage),
       openedAt: Number(openedAtRaw),
@@ -162,15 +160,20 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
   };
 
   const fetchAll = useCallback(async () => {
+    if (running.current) return running.current;
+    const currentGeneration = generation.current;
+    const current = () => currentGeneration === generation.current;
+    const task = (async () => {
     try {
+      const fetchedAt = Date.now();
       const ex = PAPERTRADE_CONTRACTS.Exchange;
       const tok = PAPERTRADE_CONTRACTS.PaperTokenomics;
       const pap = PAPERTRADE_CONTRACTS.PaperToken;
       const stk = PAPERTRADE_CONTRACTS.PaperStaking;
 
-      const [blockNumber, coreResults] = await Promise.all([
-        publicClient.getBlockNumber(),
-        publicClient.multicall({
+      const blockNumber = await publicClient.getBlockNumber();
+      const coreResults = await publicClient.multicall({
+          blockNumber,
           contracts: [
             { address: ex, abi: EXCHANGE_ABI, functionName: 'treasury' },
             { address: ex, abi: EXCHANGE_ABI, functionName: 'totalBalances' },
@@ -190,24 +193,32 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
             { address: stk, abi: PAPER_STAKING_ABI, functionName: 'accRewardPerShare' },
           ],
           allowFailure: true,
-        }),
-      ]);
+        });
+      assertReadSuccess(coreResults, 'Protocol');
 
-      const qHead = Number(coreResults[6]?.result ?? 1n);
-      const nextPosId = Number(coreResults[7]?.result ?? 0n);
+      const qHead = Number(coreResults[6].result);
+      if (!Number.isSafeInteger(qHead)) throw new Error('Queue identifier exceeds supported display precision.');
+      const nextPosRaw = coreResults[7].result as bigint;
+      const nextPosId = Number(nextPosRaw);
 
       // Fetch the 14 most recent on-chain positions to animate the Trading Pit & Basement Press
       const sampleCount = 14;
-      const posIdsToQuery: number[] = [];
+      const posIdsToQuery: string[] = [];
       for (let i = 1; i <= sampleCount; i++) {
-        if (nextPosId - i > 0) posIdsToQuery.push(nextPosId - i);
+        if (nextPosRaw - BigInt(i) > 0n) posIdsToQuery.push(String(nextPosRaw - BigInt(i)));
       }
 
-      // Fetch queue nodes around queueHead (last 4 resolved + next 4 in line)
-      const queueIdsToQuery: number[] = [];
-      const startQ = Math.max(1, qHead - 4);
-      for (let q = startQ; q <= qHead + 3; q++) {
-        queueIdsToQuery.push(q);
+      const activeQueueNodes: OnChainQueueNode[] = [];
+      let nextQueue = BigInt(qHead);
+      const seenQueue = new Set<bigint>();
+      while (nextQueue > 0n && activeQueueNodes.length < 8) {
+        if (seenQueue.has(nextQueue) || nextQueue > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Invalid payout queue.');
+        seenQueue.add(nextQueue);
+        const [user, amount, next, userNext] = await publicClient.readContract({ address: ex, abi: EXCHANGE_ABI, functionName: 'queueNode', args: [nextQueue], blockNumber });
+        if (user === '0x0000000000000000000000000000000000000000') break;
+        if (amount > 0n) activeQueueNodes.push({ id: Number(nextQueue), user, amountUsd: toUsd18(amount), next: Number(next), userNext: Number(userNext) });
+        nextQueue = next;
+        if (seenQueue.size > 1000) throw new Error('Payout queue traversal exceeded safe limit.');
       }
 
       const secondaryContracts = [
@@ -217,45 +228,25 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
           functionName: 'positions' as const,
           args: [BigInt(id)] as const,
         })),
-        ...queueIdsToQuery.map((qId) => ({
-          address: ex,
-          abi: EXCHANGE_ABI,
-          functionName: 'queueNode' as const,
-          args: [BigInt(qId)] as const,
-        })),
+
       ];
 
       const secondaryResults =
         secondaryContracts.length > 0
           ? await publicClient.multicall({
+              blockNumber,
               contracts: secondaryContracts,
               allowFailure: true,
             })
           : [];
 
+      assertReadSuccess(secondaryResults, 'Positions/queue');
       const recentPositions: OnChainPosition[] = [];
       for (let i = 0; i < posIdsToQuery.length; i++) {
         const res = secondaryResults[i];
         if (res?.status === 'success') {
           const parsed = parsePositionTuple(posIdsToQuery[i], res.result);
           if (parsed) recentPositions.push(parsed);
-        }
-      }
-
-      const activeQueueNodes: OnChainQueueNode[] = [];
-      for (let j = 0; j < queueIdsToQuery.length; j++) {
-        const res = secondaryResults[posIdsToQuery.length + j];
-        if (res?.status === 'success' && Array.isArray(res.result)) {
-          const [uAddr, amtRaw, nextId, userNextId] = res.result;
-          if (uAddr && uAddr !== '0x0000000000000000000000000000000000000000') {
-            activeQueueNodes.push({
-              id: queueIdsToQuery[j],
-              user: uAddr as Address,
-              amountUsd: toUsd18(amtRaw),
-              next: Number(nextId),
-              userNext: Number(userNextId),
-            });
-          }
         }
       }
 
@@ -268,6 +259,7 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
           ? activeQueueNodes[activeQueueNodes.length - 1].id
           : qHead - 1;
 
+      if (!current()) return;
       setProtocol({
         blockNumber,
         treasuryUsd: toUsd18(coreResults[0]?.result),
@@ -292,7 +284,7 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
         activeQueueNodes,
         loading: false,
         error: null,
-        lastUpdatedMs: Date.now(),
+        lastUpdatedMs: fetchedAt,
       });
 
       // If user wallet is connected, fetch their personal on-chain state
@@ -301,6 +293,7 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
         const usdc = PAPERTRADE_CONTRACTS.USDC;
 
         const userCalls = await publicClient.multicall({
+          blockNumber,
           contracts: [
             { address: ex, abi: EXCHANGE_ABI, functionName: 'balances', args: [userAddress] },
             { address: ex, abi: EXCHANGE_ABI, functionName: 'userQueueHead', args: [userAddress] },
@@ -315,9 +308,10 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
           allowFailure: true,
         });
 
+        assertReadSuccess(userCalls, 'Account');
         const uQueueHead = Number(userCalls[1]?.result ?? 0n);
         const openIdsRaw = (userCalls[2]?.result as bigint[]) ?? [];
-        const openPositionIds = openIdsRaw.map((id) => Number(id));
+        const openPositionIds = openIdsRaw.map(String);
         const computedProxy = (userCalls[7]?.result as Address) ?? null;
         const deployedProxyRaw = (userCalls[8]?.result as Address) ?? null;
         const deployedProxy =
@@ -333,9 +327,7 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
           ...(computedProxy
             ? [{ address: usdc, abi: ERC20_ABI, functionName: 'balanceOf' as const, args: [computedProxy] as const }]
             : []),
-          ...(uQueueHead > 0
-            ? [{ address: ex, abi: EXCHANGE_ABI, functionName: 'queueNode' as const, args: [BigInt(uQueueHead)] as const }]
-            : []),
+
           ...openPositionIds.map((id) => ({
             address: ex,
             abi: EXCHANGE_ABI,
@@ -346,19 +338,14 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
 
         if (extraCalls.length > 0) {
           const extraRes = await publicClient.multicall({
+            blockNumber,
             contracts: extraCalls,
             allowFailure: true,
           });
+          assertReadSuccess(extraRes, 'Account positions');
           let offset = 0;
           if (computedProxy) {
             proxyUsdcBalance = toUsdc6(extraRes[0]?.result);
-            offset += 1;
-          }
-          if (uQueueHead > 0) {
-            const qNodeRes = extraRes[offset];
-            if (qNodeRes?.status === 'success' && Array.isArray(qNodeRes.result)) {
-              queuedAmountUsd = toUsd18(qNodeRes.result[1]);
-            }
             offset += 1;
           }
           for (let k = 0; k < openPositionIds.length; k++) {
@@ -370,7 +357,17 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
           }
         }
 
+        const queue = await sumUserQueue(userCalls[1].result as bigint, userAddress, async (id) => {
+          const node = await publicClient.readContract({ address: ex, abi: EXCHANGE_ABI, functionName: 'queueNode', args: [id], blockNumber });
+          return { user: node[0], amount: node[1], next: node[3] };
+        });
+        queuedAmountUsd = toUsd18(queue.amount);
+        if (!current()) return;
         setUserState({
+          balanceRaw: userCalls[0].result as bigint,
+          queuedRaw: queue.amount, executableQueuedRaw: queue.executable,
+          paperRaw: userCalls[4].result as bigint, stakedRaw: userCalls[5].result as bigint,
+          lastUpdatedMs: fetchedAt, error: null,
           address: userAddress,
           exchangeBalanceUsd: toUsd18(userCalls[0]?.result),
           queuedAmountUsd,
@@ -387,19 +384,33 @@ export function usePapertradeOnChainFeed(userAddress: Address | null) {
         });
       }
     } catch (err) {
+      if (!current()) return;
+      setUserState(prev => ({ ...prev, error: 'Account sync failed', lastUpdatedMs: 0 }));
       setProtocol((prev) => ({
         ...prev,
         loading: false,
         error: err instanceof Error ? err.message : 'RPC sync error',
       }));
     }
+    })();
+    running.current = task;
+    try { await task; } finally { if (running.current === task) running.current = null; }
   }, [userAddress]);
 
   useEffect(() => {
-    fetchAll();
-    const timer = window.setInterval(fetchAll, 3000);
-    return () => clearInterval(timer);
+    generation.current++;
+    running.current = null;
+    setUserState(emptyUser());
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      await fetchAll();
+      if (!stopped) timer = setTimeout(poll, 3000);
+    };
+    void poll();
+    return () => { stopped = true; generation.current++; clearTimeout(timer); };
   }, [fetchAll]);
 
-  return { protocol, userState, refreshOnChain: fetchAll };
+  return { protocol, userState: userState.address === userAddress ? userState : emptyUser(), refreshOnChain: fetchAll };
 }
+

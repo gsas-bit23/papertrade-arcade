@@ -19,11 +19,12 @@ export type BuilderCodeState = BuilderCodeConfig;
 export const DEFAULT_BUILDER_CODE_STATE: BuilderCodeConfig = {
   liveOnProtocol: false,
   phase3Live: false,
-  enabled: true,
-  stageTaggingInPayload: true,
+  enabled: false,
+  stageTaggingInPayload: false,
   builderId: 'PAPERTRADE_ARCADE_V1',
   builderCode: 'PAPERTRADE_ARCADE_V1',
   builderAddress: '0xA7CADE0000000000000000000000000000001000',
   revenueShareBps: 100, // 1% from LP revenue carve
   feeShareBps: 100,
 };
+

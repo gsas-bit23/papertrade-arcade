@@ -1,5 +1,6 @@
 /**
- * Exact Papertrade protocol math from docs.papertrade.xyz:
+ * Display estimates based on docs.papertrade.xyz; not settlement calculations.
+ * Uses launch parameters; current contract parameters and integer rounding may differ.
  * - BBO Midpoint pricing
  * - 0.2 bps deadband on winning closes
  * - Asymmetric Impact PnL scale factor (QueueLib.applyMarketImpact)
@@ -17,7 +18,7 @@ export interface InstrumentParams {
   rateMultiplier: number; // 15,000
   referenceNotional: number; // $100,000
   positionMultiplier: number; // 814.598 for BTC, 483.979 for ETH
-  priceDecimalsOnChain: number; // On-chain entryPrice is stored as price * 10
+  priceDecimalsOnChain: number; // HyperCore scale differs by asset
 }
 
 export const INSTRUMENTS: Record<AssetSymbol, InstrumentParams> = {
@@ -37,7 +38,7 @@ export const INSTRUMENTS: Record<AssetSymbol, InstrumentParams> = {
     rateMultiplier: 15000,
     referenceNotional: 100000,
     positionMultiplier: 483.979,
-    priceDecimalsOnChain: 10,
+    priceDecimalsOnChain: 100,
   },
 };
 
@@ -88,7 +89,7 @@ export function computeMarginalMintRate(
 }
 
 /**
- * Full PnL breakdown matching QueueLib.applyMarketImpact & Exchange close accounting.
+ * Estimated PnL breakdown. Never use this preview to authorize liquidation.
  */
 export function computePositionPnl(params: {
   symbol: AssetSymbol;
@@ -263,22 +264,10 @@ export function applyMarketImpact(params: {
   isLong: boolean;
   coin: AssetSymbol;
 }): { effectiveEntryPrice: number; impactBps: number; notionalUsd: number } {
-  const { midPrice, marginUsd, leverage, isLong, coin } = params;
-  const inst = INSTRUMENTS[coin];
-  const notionalUsd = marginUsd * leverage;
-  const deadbandBps = 0.2; // 0.2 bps jitter deadband
-  const sizeImpactBps =
-    (notionalUsd / inst.referenceNotional) * (1000 / inst.positionMultiplier);
-  const impactBps = deadbandBps + sizeImpactBps;
-  const impactFraction = impactBps / 10000;
-  const effectiveEntryPrice = isLong
-    ? midPrice * (1 + impactFraction)
-    : midPrice * (1 - impactFraction);
-  return {
-    effectiveEntryPrice,
-    impactBps,
-    notionalUsd,
-  };
+  const { midPrice, marginUsd, leverage } = params;
+  if (![midPrice, marginUsd, leverage].every(Number.isFinite) || midPrice < 0 || marginUsd < 0 || leverage <= 0) throw new Error('Invalid preview inputs.');
+  // Entries execute at BBO mid; the asymmetric haircut applies only to profits.
+  return { effectiveEntryPrice: midPrice, impactBps: 0, notionalUsd: marginUsd * leverage };
 }
 
 /**
@@ -292,4 +281,5 @@ export function estimateMintedPaperOnLoss(
   const rate = computeMarginalMintRate(trackedLpUsd, tailProgressUsd);
   return Math.max(0, lossUsd) * rate;
 }
+
 

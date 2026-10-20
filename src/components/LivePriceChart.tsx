@@ -77,7 +77,7 @@ export const LivePriceChart: React.FC<LivePriceChartProps> = ({
   const maxP = rawMax + range * 0.12;
 
   const toX = (i: number) =>
-    padLeft + (i / Math.max(1, history.length - 1)) * plotW;
+    padLeft + ((history[i].time - history[0].time) / Math.max(1, history[history.length - 1].time - history[0].time)) * plotW;
   const toY = (price: number) =>
     padTop + (1 - (price - minP) / Math.max(0.0001, maxP - minP)) * plotH;
 
@@ -153,7 +153,7 @@ export const LivePriceChart: React.FC<LivePriceChartProps> = ({
             }}
           >
             {isPositive ? '+' : ''}
-            {changePct.toFixed(2)}%
+            {changePct.toFixed(2)}% window
           </span>
           <span style={{ fontSize: 12, color: '#94a3b8' }}>
             Bid <strong style={{ color: '#34d399' }}>${fmt(bid)}</strong> • Ask{' '}
@@ -211,7 +211,8 @@ export const LivePriceChart: React.FC<LivePriceChartProps> = ({
             const relX =
               ((e.clientX - rect.left) / rect.width) * width - padLeft;
             const ratio = Math.max(0, Math.min(1, relX / plotW));
-            const idx = Math.round(ratio * (history.length - 1));
+            const target = history[0].time + ratio * (history[history.length - 1].time - history[0].time);
+            const idx = history.reduce((best, point, i) => Math.abs(point.time - target) < Math.abs(history[best].time - target) ? i : best, 0);
             setHoverIdx(idx);
           }}
         >
@@ -380,3 +381,4 @@ export const LivePriceChart: React.FC<LivePriceChartProps> = ({
     </div>
   );
 };
+
