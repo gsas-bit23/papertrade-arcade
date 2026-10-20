@@ -1,0 +1,342 @@
+:root {
+  --bg-main: #070b14;
+  --bg-card: #0f172a;
+  --bg-card-alt: #131e36;
+  --border-subtle: #1e293b;
+  --border-strong: #334155;
+  --green: #10b981;
+  --green-bright: #34d399;
+  --red: #f43f5e;
+  --red-bright: #fb7185;
+  --gold: #facc15;
+  --cyan: #38bdf8;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-title: 'Press Start 2P', monospace;
+  --font-pixel: 'Silkscreen', monospace;
+  --font-mono: 'VT323', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-x: hidden;
+}
+
+.card-surface {
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+/* Top Bar */
+.top-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 20px;
+  background: #0b1120;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.brand-logo {
+  font-family: var(--font-title);
+  font-size: 13px;
+  color: var(--gold);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Asset Selector Tabs */
+.asset-switcher {
+  display: inline-flex;
+  background: #060a12;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  gap: 4px;
+}
+
+.asset-tab {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 7px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: all 0.15s;
+}
+
+.asset-tab.active {
+  background: #1e293b;
+  color: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* Top Summary Stat Strip */
+.stats-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  padding: 12px 20px 0 20px;
+  max-width: 1560px;
+  margin: 0 auto;
+}
+
+@media (max-width: 960px) {
+  .stats-strip {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.stat-card {
+  background: #0c1324;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-card-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+}
+
+.stat-card-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.stat-card-sub {
+  font-size: 11px;
+  color: #64748b;
+}
+
+/* Main 2-Column Workspace */
+.workspace-grid {
+  display: grid;
+  grid-template-columns: 1fr 375px;
+  gap: 16px;
+  padding: 14px 20px 28px 20px;
+  max-width: 1560px;
+  margin: 0 auto;
+  align-items: start;
+}
+
+@media (max-width: 1120px) {
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Buttons */
+.btn {
+  border: 1px solid var(--border-strong);
+  background: #1e293b;
+  color: #f8fafc;
+  padding: 8px 13px;
+  border-radius: 7px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.14s;
+}
+
+.btn:hover:not(:disabled) {
+  background: #334155;
+  border-color: #64748b;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-green {
+  background: #059669;
+  border-color: #10b981;
+  color: #ffffff;
+}
+.btn-green:hover:not(:disabled) {
+  background: #10b981;
+}
+
+.btn-red {
+  background: #e11d48;
+  border-color: #f43f5e;
+  color: #ffffff;
+}
+.btn-red:hover:not(:disabled) {
+  background: #f43f5e;
+}
+
+.btn-gold {
+  background: #ca8a04;
+  border-color: #facc15;
+  color: #ffffff;
+}
+.btn-gold:hover:not(:disabled) {
+  background: #eab308;
+}
+
+.pill-btn {
+  border: 1px solid #334155;
+  background: #0f172a;
+  color: #94a3b8;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pill-btn.active {
+  background: #1e293b;
+  color: #38bdf8;
+  border-color: #38bdf8;
+}
+
+/* Pixel Building Cross-Section (Clean & Visual) */
+.building-container {
+  border: 2px solid #334155;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #090e1a;
+}
+
+.floor-section {
+  border-bottom: 2px solid #1e293b;
+  padding: 14px 16px;
+  transition: background 0.15s;
+}
+
+.floor-section:last-child {
+  border-bottom: none;
+}
+
+.floor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.floor-badge {
+  font-family: var(--font-pixel);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #1e293b;
+  color: var(--gold);
+  border: 1px solid #475569;
+}
+
+/* Trade Ticket on Right */
+.trade-ticket {
+  position: sticky;
+  top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.direction-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  background: #070b14;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid #1e293b;
+}
+
+.dir-tab {
+  border: none;
+  padding: 10px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+  background: transparent;
+  color: #94a3b8;
+  transition: all 0.15s;
+}
+
+.dir-tab.long.active {
+  background: #059669;
+  color: #ffffff;
+}
+
+.dir-tab.short.active {
+  background: #e11d48;
+  color: #ffffff;
+}
+
+.clean-input {
+  width: 100%;
+  background: #070b14;
+  border: 1px solid #334155;
+  border-radius: 7px;
+  padding: 10px 12px;
+  color: #f8fafc;
+  font-size: 18px;
+  font-weight: 700;
+  outline: none;
+}
+
+.clean-input:focus {
+  border-color: var(--cyan);
+}
+
+.summary-box {
+  background: #080d18;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.summary-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.summary-line strong {
+  color: #f8fafc;
+  font-size: 13px;
+}
